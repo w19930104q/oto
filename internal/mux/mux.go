@@ -379,6 +379,12 @@ func (p *Player) SetBufferSize(bufferSize int) {
 }
 
 func (p *playerImpl) setBufferSize(bufferSize int) {
+	// Signal after releasing the player lock, as signal takes the mux's
+	// condition lock and wait inspects players under it. A larger buffer can
+	// make a parked player readable again, so without the signal the loop
+	// would not fill it until the next ReadFloat32s.
+	defer p.mux.signal()
+
 	p.m.Lock()
 	defer p.m.Unlock()
 
