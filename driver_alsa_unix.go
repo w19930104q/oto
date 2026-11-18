@@ -26,6 +26,7 @@ import (
 	"github.com/ebitengine/purego"
 
 	"github.com/ebitengine/oto/v3/internal/mux"
+	"github.com/ebitengine/oto/v3/internal/resample"
 )
 
 const (
@@ -124,11 +125,14 @@ type alsaContext struct {
 
 	cond *sync.Cond
 
-	mux *mux.Mux
-	err atomicError
+	// reader is the stream the device pulls from: a resampling chain that
+	// converts the multiplexer to the device's sample rate and corrects clock
+	// drift. When the rates match, the chain passes frames straight through.
+	reader *resample.Chain
+	err    atomicError
 }
 
-func newALSAContextImpl(sampleRate int, channelCount int, mux *mux.Mux, bufferSizeInBytes int) (*alsaContext, error) {
+func newALSAContextImpl(sourceRate int, channelCount int, mx *mux.Mux, bufferSizeInBytes int) (*alsaContext, error) {
 	if channelCount != 1 && channelCount != 2 {
 		return nil, fmt.Errorf("oto: ALSA backend supports only mono or stereo output: %d", channelCount)
 	}
@@ -139,7 +143,6 @@ func newALSAContextImpl(sampleRate int, channelCount int, mux *mux.Mux, bufferSi
 	c := &alsaContext{
 		channelCount: channelCount,
 		cond:         sync.NewCond(&sync.Mutex{}),
-		mux:          mux,
 	}
 
 	// TODO: Should snd_pcm_hw_params_set_periods be called explicitly?
@@ -153,10 +156,13 @@ func newALSAContextImpl(sampleRate int, channelCount int, mux *mux.Mux, bufferSi
 	} else {
 		periodSize = 1024
 	}
-	periodSize, err := c.openDevice(deviceCandidates(), sampleRate, channelCount, periodSize*periods, periodSize)
+	// The device may run at another rate than the source. Open it first to
+	// learn the rate it settles on, then build the resampling chain for it.
+	deviceRate, err := c.openDevice(deviceCandidates(), sourceRate, channelCount, periodSize*periods, periodSize)
 	if err != nil {
 		return nil, err
 	}
+	c.reader = resample.NewChain(mx.ReadFloat32s, mx.SetPlayed, mx.ClearPlayed, sourceRate, deviceRate, channelCount)
 
 	go func() {
 		// The loop only returns when readAndWrite hits a permanent error, so close the
@@ -173,7 +179,9 @@ func newALSAContextImpl(sampleRate int, channelCount int, mux *mux.Mux, bufferSi
 	return c, nil
 }
 
-func (c *alsaContext) openDevice(names []string, sampleRate, channelCount int, bufferSize, periodSize uint) (uint, error) {
+// openDevice opens the first usable device and returns the sample rate it
+// will run at, which may differ from the requested source rate.
+func (c *alsaContext) openDevice(names []string, sourceRate, channelCount int, bufferSize, periodSize uint) (int, error) {
 	var deviceErrs []string
 	for _, name := range names {
 		var handle uintptr
@@ -185,59 +193,63 @@ func (c *alsaContext) openDevice(names []string, sampleRate, channelCount int, b
 
 		// ALSA adjusts these sizes while configuring each device.
 		bs, ps := bufferSize, periodSize
-		if err := c.alsaPCMHwParams(sampleRate, channelCount, &bs, &ps); err != nil {
+		rate, err := c.alsaPCMHwParams(sourceRate, channelCount, &bs, &ps)
+		if err != nil {
 			_snd_pcm_close(handle)
 			c.handle = 0
 			deviceErrs = append(deviceErrs, fmt.Sprintf("%q: %v", name, err))
 			continue
 		}
-		return ps, nil
+		return rate, nil
 	}
 	return 0, fmt.Errorf("oto: ALSA device initialization failed: %s", strings.Join(deviceErrs, ", "))
 }
 
-func (c *alsaContext) alsaPCMHwParams(sampleRate, channelCount int, bufferSize, periodSize *uint) error {
+// alsaPCMHwParams configures the device and returns the sample rate it will
+// run at, which set_rate_near may change from the requested source rate.
+func (c *alsaContext) alsaPCMHwParams(sourceRate, channelCount int, bufferSize, periodSize *uint) (int, error) {
 	var params uintptr
 	if err := _snd_pcm_hw_params_malloc(&params); err < 0 {
-		return alsaError("snd_pcm_hw_params_malloc", err)
+		return 0, alsaError("snd_pcm_hw_params_malloc", err)
 	}
 	defer _snd_pcm_hw_params_free(params)
 
 	if err := _snd_pcm_hw_params_any(c.handle, params); err < 0 {
-		return alsaError("snd_pcm_hw_params_any", err)
+		return 0, alsaError("snd_pcm_hw_params_any", err)
 	}
 	if err := _snd_pcm_hw_params_set_access(c.handle, params, _SND_PCM_ACCESS_RW_INTERLEAVED); err < 0 {
-		return alsaError("snd_pcm_hw_params_set_access", err)
+		return 0, alsaError("snd_pcm_hw_params_set_access", err)
 	}
 	if err := _snd_pcm_hw_params_set_format(c.handle, params, _SND_PCM_FORMAT_FLOAT_LE); err < 0 {
-		return alsaError("snd_pcm_hw_params_set_format", err)
+		return 0, alsaError("snd_pcm_hw_params_set_format", err)
 	}
 	if err := _snd_pcm_hw_params_set_channels(c.handle, params, uint32(channelCount)); err < 0 {
-		return alsaError("snd_pcm_hw_params_set_channels", err)
+		return 0, alsaError("snd_pcm_hw_params_set_channels", err)
 	}
-	if err := _snd_pcm_hw_params_set_rate_resample(c.handle, params, 1); err < 0 {
-		return alsaError("snd_pcm_hw_params_set_rate_resample", err)
+	// Disable ALSA's own rate conversion: oto resamples to the device rate in
+	// the resampling chain, so a mismatch is handled there, not in the plugin.
+	if err := _snd_pcm_hw_params_set_rate_resample(c.handle, params, 0); err < 0 {
+		return 0, alsaError("snd_pcm_hw_params_set_rate_resample", err)
 	}
-	sr := uint32(sampleRate)
-	if uint64(sr) != uint64(sampleRate) {
-		return fmt.Errorf("oto: sample rate cannot be represented as uint32: %d", sampleRate)
+	sr := uint32(sourceRate)
+	if uint64(sr) != uint64(sourceRate) {
+		return 0, fmt.Errorf("oto: sample rate cannot be represented as uint32: %d", sourceRate)
 	}
 	if err := _snd_pcm_hw_params_set_rate_near(c.handle, params, &sr, nil); err < 0 {
-		return alsaError("snd_pcm_hw_params_set_rate_near", err)
-	}
-	if sr != uint32(sampleRate) {
-		return fmt.Errorf("oto: ALSA device uses sample rate %d instead of %d", sr, sampleRate)
+		return 0, alsaError("snd_pcm_hw_params_set_rate_near", err)
 	}
 	if err := _snd_pcm_hw_params_set_buffer_size_near(c.handle, params, bufferSize); err < 0 {
-		return alsaError("snd_pcm_hw_params_set_buffer_size_near", err)
+		return 0, alsaError("snd_pcm_hw_params_set_buffer_size_near", err)
 	}
 	if err := _snd_pcm_hw_params_set_period_size_near(c.handle, params, periodSize, nil); err < 0 {
-		return alsaError("snd_pcm_hw_params_set_period_size_near", err)
+		return 0, alsaError("snd_pcm_hw_params_set_period_size_near", err)
 	}
 	if err := _snd_pcm_hw_params(c.handle, params); err < 0 {
-		return alsaError("snd_pcm_hw_params", err)
+		return 0, alsaError("snd_pcm_hw_params", err)
 	}
-	return nil
+	// The device runs at the rate set_rate_near settled on. A mismatch with
+	// the source is resampled by the chain instead of being an error.
+	return int(sr), nil
 }
 
 func (c *alsaContext) readAndWrite(buf32 []float32) bool {
@@ -251,7 +263,7 @@ func (c *alsaContext) readAndWrite(buf32 []float32) bool {
 		return false
 	}
 
-	c.mux.ReadFloat32s(buf32)
+	c.reader.Read(buf32)
 
 	buf := buf32
 	for len(buf) > 0 {
@@ -261,7 +273,7 @@ func (c *alsaContext) readAndWrite(buf32 []float32) bool {
 		}
 		if n < 0 {
 			c.err.Join(alsaError("snd_pcm_writei or snd_pcm_recover", int32(n)))
-			c.mux.ClearPlayed()
+			c.reader.ClearPlayed()
 			return false
 		}
 		buf = buf[n*c.channelCount:]
@@ -271,9 +283,9 @@ func (c *alsaContext) readAndWrite(buf32 []float32) bool {
 	// snd_pcm_delay gives how many of the frames written are not played yet.
 	var delay int
 	if _snd_pcm_delay(c.handle, &delay) < 0 {
-		c.mux.ClearPlayed()
+		c.reader.ClearPlayed()
 	} else {
-		c.mux.SetPlayed(c.written-int64(delay), time.Now())
+		c.reader.SetPlayed(c.written-int64(delay), time.Now())
 	}
 	return true
 }
@@ -287,7 +299,7 @@ func (c *alsaContext) Suspend() error {
 	}
 
 	c.suspended = true
-	c.mux.ClearPlayed()
+	c.reader.ClearPlayed()
 
 	// Do not use snd_pcm_pause as not all devices support this.
 	// Do not use snd_pcm_drop as this might hang (https://github.com/libsdl-org/SDL/blob/a5c610b0a3857d3138f3f3da1f6dc3172c5ea4a8/src/audio/alsa/SDL_alsa_audio.c#L478).

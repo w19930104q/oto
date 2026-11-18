@@ -31,8 +31,9 @@ type unixBackend interface {
 
 // newALSAContext creates the ALSA fallback backend. driver_alsa_unix.go's init sets it on the
 // platforms where that file is built; it is nil elsewhere (e.g. OpenBSD), in which case only the
-// PulseAudio backend is attempted.
-var newALSAContext func(sampleRate, channelCount int, mux *mux.Mux, bufferSizeInBytes int) (unixBackend, error)
+// PulseAudio backend is attempted. The backend resamples from mx's sample rate if the device runs
+// at another rate.
+var newALSAContext func(sampleRate, channelCount int, mx *mux.Mux, bufferSizeInBytes int) (unixBackend, error)
 
 type context struct {
 	mux     *mux.Mux
