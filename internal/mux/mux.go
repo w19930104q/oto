@@ -555,6 +555,66 @@ func (p *Player) Reset() {
 	p.p.Reset()
 }
 
+func (p *Player) SwitchSource(src io.Reader) {
+	p.p.SwitchSource(src)
+}
+
+// SwitchSource atomically replaces the player's source.
+//
+// The data buffered from the current source, including the data already sent to
+// the audio hardware but not played yet, is played first, and then the new
+// source starts. No data is discarded or repeated, so joining sources has no
+// gap or duplicated samples. The source is changed between the blocks the
+// audio hardware reads, never in the middle of one, so the output stays
+// continuous.
+//
+// After SwitchSource returns, the old source is never read again. An ongoing
+// read from it, if any, is waited for and its result is discarded, so the old
+// source can be closed safely once SwitchSource returns.
+//
+// The player's playing state, volume, and buffer size are kept. A playing
+// player keeps playing, and a paused player stays paused until Play is called.
+//
+// SwitchSource does not require the sources to implement io.Seeker.
+//
+// SwitchSource is concurrent-safe, like the other player controls.
+func (p *playerImpl) SwitchSource(src io.Reader) {
+	defer p.mux.signal()
+
+	p.m.Lock()
+	defer p.m.Unlock()
+
+	p.waitForSeekImpl()
+
+	if p.state == playerClosed {
+		return
+	}
+
+	// Wait until an ongoing read from the old source finishes. The source must
+	// not be read after SwitchSource returns, and a read that started before the
+	// switch would append data of the old source to the buffer.
+	p.waitForReadImpl()
+
+	// Remember whether the old source had already ended. The auto-pause that
+	// follows an end is not an explicit Pause, so replacing the source revives
+	// the player rather than leaving it stopped.
+	ended := p.eof
+
+	p.src = src
+	// The result of any read that escaped the wait is data of the old source and
+	// must be discarded, as when seeking.
+	p.srcGen++
+	// The new source has neither ended nor failed, even if the old one had.
+	p.eof = false
+	p.srcErr = nil
+
+	// A player that was playing, or whose old source had ended, keeps playing
+	// with the new source. A player paused explicitly stays paused until Play.
+	if p.state == playerPlay || ended {
+		p.playImpl()
+	}
+}
+
 func (p *playerImpl) Reset() {
 	p.m.Lock()
 	defer p.m.Unlock()

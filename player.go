@@ -16,6 +16,7 @@ package oto
 
 import (
 	"fmt"
+	"io"
 
 	"github.com/ebitengine/oto/v3/internal/mux"
 )
@@ -59,6 +60,29 @@ func (p *Player) IsPlaying() bool {
 // Deprecated: as of v2.3. Use [Player.Pause], [Player.PauseAndStopReading], or [Player.Seek] instead.
 func (p *Player) Reset() {
 	p.player.Reset()
+}
+
+// SwitchSource atomically replaces the player's source with r.
+//
+// The data already read from the current source is played first, including the
+// data sent to the audio hardware but not played yet, and r then starts where
+// it ends. No sample is skipped or repeated, so the sources join without a gap
+// or a duplicated sample. The sources are switched only at a boundary of the
+// blocks read by the audio hardware, never in the middle of a block, so the
+// output stays continuous.
+//
+// After SwitchSource returns, the old source is never read again. It blocks
+// until an ongoing read from the old source finishes, if any, and the result of
+// that read is discarded, so the old source can be closed safely once
+// SwitchSource returns. Neither source has to implement [io.Seeker].
+//
+// The playing state is kept: a playing player keeps playing, and a paused
+// player stays paused until [Player.Play] is called. The volume and the buffer
+// size are kept as well.
+//
+// SwitchSource is concurrent-safe.
+func (p *Player) SwitchSource(r io.Reader) {
+	p.player.SwitchSource(r)
 }
 
 // Volume returns the current volume, which is 0 or larger.

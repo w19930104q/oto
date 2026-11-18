@@ -165,6 +165,8 @@ func durationToBufferSize(duration time.Duration, sampleRate, channelCount int) 
 // If you want to seek the position of r, call the player's Seek function,
 // which also clears the underlying buffer.
 // If you want to stop using r (e.g. you want to close r), call the player's PauseAndStopReading function.
+// To join another source onto the one playing, without reloading the player or
+// losing buffered data, call the player's SwitchSource function.
 //
 // You cannot share r by multiple players.
 // Reads from players' sources are performed sequentially. A Read that blocks
