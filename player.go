@@ -16,6 +16,7 @@ package oto
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/ebitengine/oto/v3/internal/mux"
 )
@@ -72,6 +73,51 @@ func (p *Player) Volume() float64 {
 // A value out of the range, including NaN, is treated as 0.
 func (p *Player) SetVolume(volume float64) {
 	p.player.SetVolume(volume)
+}
+
+// GainPoint is a breakpoint of a gain envelope.
+// See [Player.SetGainEnvelope].
+type GainPoint struct {
+	// At is the time from the start of the envelope. A negative value is
+	// treated as 0.
+	At time.Duration
+
+	// Gain is the envelope gain at At. A value out of the range of
+	// [0, math.MaxFloat32], including NaN, is treated as 0.
+	Gain float64
+}
+
+// SetGainEnvelope sets the player's gain envelope, which is multiplied with
+// the volume when the player is mixed with the other players.
+//
+// The envelope is a piecewise-linear gain curve over the player's played
+// output: the gain is interpolated linearly between the given points, and
+// kept at the last point's gain after the last point. The curve starts from
+// the gain the previous envelope has at this position and ramps to the first
+// point, so setting an envelope never causes a jump, and the gain changes
+// smoothly without a click. The envelope's clock is the player's output: it
+// advances only while the player is playing, and pausing the player pauses
+// the envelope.
+//
+// The envelope is evaluated at every frame of the output, so the gain curve
+// is the same no matter how the output is chunked into buffers, and a player
+// mixed with other players sounds exactly as it would played alone: the mixed
+// output is the sum of what each player would play by itself.
+//
+// Calling SetGainEnvelope with no points clears the envelope, back to a gain
+// of 1. To avoid a jump, end the envelope with a ramp to 1 before clearing
+// it.
+//
+// SetGainEnvelope is concurrent-safe.
+func (p *Player) SetGainEnvelope(points ...GainPoint) {
+	pts := make([]mux.EnvelopePoint, len(points))
+	for i, pt := range points {
+		pts[i] = mux.EnvelopePoint{
+			At:   pt.At,
+			Gain: pt.Gain,
+		}
+	}
+	p.player.SetGainEnvelope(pts)
 }
 
 // BufferedSize returns the byte size of the buffered data that is not sent to the audio hardware yet.

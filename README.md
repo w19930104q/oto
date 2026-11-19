@@ -216,6 +216,34 @@ myPlayer.SetBufferSize(newBufferSize)
 
 `NewPlayer` returns a `*oto.Player`, which has functions like `SetBufferSize` and `Seek`.
 
+### Mixing and gain envelopes
+
+A context mixes any number of players into its single output. The mixed output is the sum of
+what each player would play by itself: a player sounds the same whether it plays alone or
+together with other players, no matter how many players are mixed.
+
+Each player's gain is the product of its volume (`Player.SetVolume`) and its gain envelope
+(`Player.SetGainEnvelope`). An envelope is a piecewise-linear gain curve over the player's
+played output, given as `(time, gain)` points:
+
+```go
+// Fade in over 100ms, hold, then fade out over 200ms.
+myPlayer.SetGainEnvelope(
+    oto.GainPoint{At: 0, Gain: 0},
+    oto.GainPoint{At: 100 * time.Millisecond, Gain: 1},
+    oto.GainPoint{At: 500 * time.Millisecond, Gain: 1},
+    oto.GainPoint{At: 700 * time.Millisecond, Gain: 0},
+)
+```
+
+The gain is interpolated linearly between the points and kept at the last point's gain after
+the last point. The curve starts from the gain the previous envelope has reached, so replacing
+an envelope never causes a jump, and the gain changes smoothly without a click. The envelope
+is evaluated at every frame of the output, so the curve is the same no matter how the output
+is chunked into buffers. The envelope's clock is the player's output: pausing the player
+pauses the envelope. Calling `SetGainEnvelope` with no points clears the envelope, back to a
+gain of 1.
+
 ## Crosscompiling
 
 Crosscompiling to macOS, Windows, Linux or BSD is as easy as setting `GOOS=darwin`, `GOOS=windows`,

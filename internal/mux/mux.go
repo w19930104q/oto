@@ -17,14 +17,18 @@
 package mux
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/ebitengine/oto/v3/internal/mathutil"
 )
 
 // Format must be kept in sync with oto's Format.
@@ -46,6 +50,25 @@ func (f Format) ByteLength() int {
 		return 2
 	}
 	panic(fmt.Sprintf("mux: unexpected format: %d", f))
+}
+
+// EnvelopePoint is a breakpoint of a player's gain envelope.
+// See Player.SetGainEnvelope.
+type EnvelopePoint struct {
+	// At is the time from the start of the envelope. A negative value is
+	// treated as 0.
+	At time.Duration
+
+	// Gain is the envelope gain at At. A value out of the range of
+	// [0, math.MaxFloat32], including NaN, is treated as 0.
+	Gain float64
+}
+
+// envPoint is an EnvelopePoint converted to the player's output timeline.
+type envPoint struct {
+	// frame is the position in frames from the start of the envelope.
+	frame int64
+	gain  float64
 }
 
 // Mux is a low-level multiplexer of audio players.
@@ -319,6 +342,21 @@ type playerImpl struct {
 	// sent holds the spans of the mix this player's data went into, oldest
 	// first, while they may be unplayed.
 	sent []sentSpan
+
+	// env holds the player's gain envelope: breakpoints in frames, sorted by
+	// frame, on the player's mixed-output timeline. The envelope starts when
+	// mixedSamples was envStartSamples, with the envelope gain envFrom, so
+	// replacing an envelope continues the previous one without a jump.
+	// A nil env means no envelope, which is a gain of 1.
+	env             []envPoint
+	envStartSamples int64
+	envFrom         float64
+
+	// mixedSamples counts the samples of this player mixed into the output.
+	// The envelope is evaluated at the frame a sample belongs to, so the gain
+	// curve depends only on the mixed output, never on how the output is
+	// chunked into buffers.
+	mixedSamples int64
 
 	m sync.Mutex
 }
@@ -615,6 +653,109 @@ func (p *playerImpl) SetVolume(volume float64) {
 	}
 }
 
+func (p *Player) SetGainEnvelope(points []EnvelopePoint) {
+	p.p.SetGainEnvelope(points)
+}
+
+// SetGainEnvelope sets the player's gain envelope, which is multiplied with
+// the volume when the player is mixed.
+//
+// The envelope is a piecewise-linear gain curve over the player's mixed
+// output: the gain is interpolated linearly between the given points, kept at
+// the last point's gain after the last point, and ramped from the gain the
+// previous envelope has at this position to the first point, so setting an
+// envelope never causes a jump. The envelope's clock is the player's output:
+// it advances only while the player is playing, and pausing the player pauses
+// the envelope.
+//
+// The envelope is evaluated at every frame of the output, so the gain curve
+// is the same no matter how the output is chunked into buffers, and a player
+// mixed with others sounds exactly as it would mixed alone.
+//
+// Calling SetGainEnvelope with no points clears the envelope, back to a gain
+// of 1. To avoid a jump, end the envelope with a ramp to 1 before clearing
+// it.
+//
+// SetGainEnvelope is concurrent-safe, like the other player controls.
+func (p *playerImpl) SetGainEnvelope(points []EnvelopePoint) {
+	p.m.Lock()
+	defer p.m.Unlock()
+
+	// The new envelope starts from the gain the previous envelope has at this
+	// position, so replacing an envelope never causes a jump.
+	from := p.envelopeGainAt(p.mixedSamples)
+
+	env := make([]envPoint, 0, len(points))
+	for _, pt := range points {
+		// A gain out of the range is treated as 0, as in SetVolume.
+		gain := pt.Gain
+		if !(gain > 0) || gain > math.MaxFloat32 {
+			gain = 0
+		}
+		at := pt.At
+		if at < 0 {
+			at = 0
+		}
+		frame, ok := mathutil.MulDiv(int64(at), int64(p.mux.sampleRate), int64(time.Second))
+		if !ok {
+			// A time that does not fit in int64 frames is infinitely far away.
+			frame = math.MaxInt64
+		}
+		env = append(env, envPoint{
+			frame: frame,
+			gain:  gain,
+		})
+	}
+	slices.SortStableFunc(env, func(a, b envPoint) int {
+		return cmp.Compare(a.frame, b.frame)
+	})
+
+	p.env = env
+	p.envStartSamples = p.mixedSamples
+	p.envFrom = from
+}
+
+// envelopeGainAt returns the envelope's gain at the player's mixed-output
+// position mixedSamples. It returns 1 when the player has no envelope.
+//
+// When envelopeGainAt is called, the mutex m must be locked.
+func (p *playerImpl) envelopeGainAt(mixedSamples int64) float64 {
+	env := p.env
+	if len(env) == 0 {
+		return 1
+	}
+
+	// t is the position in frames since the envelope was set. Samples of one
+	// frame share the frame's gain.
+	t := (mixedSamples - p.envStartSamples) / int64(p.mux.channelCount)
+
+	// The envelope starts at the gain the previous envelope had when this one
+	// was set, unless a point at the very start replaces it.
+	gain := p.envFrom
+	var frame int64
+	start := 0
+	if env[0].frame <= 0 {
+		gain = env[0].gain
+		frame = env[0].frame
+		start = 1
+	}
+	if t <= frame {
+		return gain
+	}
+	for i := start; i < len(env); i++ {
+		next := env[i].frame
+		if t < next {
+			if span := next - frame; span > 0 {
+				return gain + (env[i].gain-gain)*float64(t-frame)/float64(span)
+			}
+			// Points at the same frame step to the later point's gain.
+			return env[i].gain
+		}
+		gain, frame = env[i].gain, next
+	}
+	return gain
+}
+
 func (p *Player) BufferedSize() int {
 	return p.p.BufferedSize()
 }
@@ -744,6 +885,7 @@ func (p *playerImpl) readBufferAndAdd(buf []float32, start int64) int {
 
 	src := p.buf[p.readPos : p.readPos+n*bitDepthInBytes]
 
+	hasEnvelope := len(p.env) > 0
 	for i := range n {
 		var v float32
 		switch format {
@@ -768,6 +910,9 @@ func (p *playerImpl) readBufferAndAdd(buf []float32, start int64) int {
 			}
 			s = v * (volume*rate + prevVolume*(1-rate))
 		}
+		if hasEnvelope {
+			s *= float32(p.envelopeGainAt(p.mixedSamples + int64(i)))
+		}
 
 		// Add the value only when the mixed value stays finite, and skip this player otherwise.
 		// A float32 source can supply NaN or infinity, and the accumulation can overflow
@@ -783,6 +928,7 @@ func (p *playerImpl) readBufferAndAdd(buf []float32, start int64) int {
 
 	if n > 0 {
 		p.recordSent(start, start+int64(n))
+		p.mixedSamples += int64(n)
 	}
 
 	// The consumed region is compacted lazily when the buffer is refilled.

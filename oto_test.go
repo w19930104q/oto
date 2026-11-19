@@ -60,3 +60,19 @@ func TestSetBufferSize(t *testing.T) {
 		}
 	}
 }
+
+func TestSetGainEnvelope(t *testing.T) {
+	bs := bytes.NewReader(make([]byte, 4096))
+	p := theContext.NewPlayer(bs)
+	p.SetGainEnvelope(
+		oto.GainPoint{At: 0, Gain: 0},
+		oto.GainPoint{At: 5 * time.Millisecond, Gain: 1},
+		oto.GainPoint{At: 10 * time.Millisecond, Gain: 0},
+	)
+	p.Play()
+	for p.IsPlaying() {
+		time.Sleep(time.Millisecond)
+	}
+	// Clearing the envelope after the source ended is fine.
+	p.SetGainEnvelope()
+}
