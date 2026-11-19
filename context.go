@@ -209,6 +209,66 @@ func (c *Context) Err() error {
 	return c.context.Err()
 }
 
+// Stats is a snapshot of how the context observes playback: the water level
+// of the device buffer, and the drift of the device clock from the wall
+// clock.
+type Stats struct {
+	// MixedFrames is the number of frames the context has mixed and sent to
+	// the audio driver.
+	MixedFrames int64
+
+	// PlayedKnown reports whether PlayedFrames and BufferedFrames are known:
+	// whether the driver reports when frames are played and its report holds.
+	PlayedKnown bool
+
+	// PlayedFrames is the number of mixed frames the device has played. It is
+	// 0 when PlayedKnown is false.
+	PlayedFrames int64
+
+	// BufferedFrames is the water level: the frames sent to the audio driver
+	// but not played yet. It is 0 when PlayedKnown is false.
+	BufferedFrames int64
+
+	// Drift is the statistics of the device clock's deviation from the wall
+	// clock.
+	Drift DriftStats
+}
+
+// DriftStats is statistics of how fast the device clock runs against the wall
+// clock, over the span from the driver's first to its last report.
+type DriftStats struct {
+	// Reports is the number of the driver's reports the span covers. The span
+	// restarts when the device is suspended or the played position goes back.
+	Reports int64
+
+	// Ratio is the device clock's rate over the span relative to the nominal
+	// sample rate: 1 when the clocks agree, above 1 when the device plays
+	// faster. It is computed from the span's ends, so it does not depend on
+	// how often the driver reports in between. It is 0 while fewer than two
+	// reports are in.
+	Ratio float64
+}
+
+// Stats returns a snapshot of how the context observes playback: how much of
+// the mix is buffered in the device and not played yet, and how the device
+// clock drifts from the wall clock. Observing does not affect the played
+// audio.
+//
+// Stats is concurrent-safe.
+func (c *Context) Stats() Stats {
+	s := c.context.mux.Stats()
+	return Stats{
+		MixedFrames:    s.MixedFrames,
+		PlayedKnown:    s.PlayedKnown,
+		PlayedFrames:   s.PlayedFrames,
+		BufferedFrames: s.BufferedFrames,
+		Drift: DriftStats{
+			Reports: s.Drift.Reports,
+			Ratio:   s.Drift.Ratio,
+		},
+	}
+}
+
 type atomicError struct {
 	err error
 	m   sync.Mutex

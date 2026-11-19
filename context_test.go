@@ -183,3 +183,19 @@ func TestDurationToBufferSize(t *testing.T) {
 		})
 	}
 }
+
+func TestStats(t *testing.T) {
+	s := theContext.Stats()
+	if s.MixedFrames < 0 {
+		t.Errorf("Stats().MixedFrames = %d; want 0 or more", s.MixedFrames)
+	}
+	if !s.PlayedKnown && (s.PlayedFrames != 0 || s.BufferedFrames != 0) {
+		t.Errorf("Stats() = %+v; want PlayedFrames and BufferedFrames 0 while PlayedKnown is false", s)
+	}
+	if s.BufferedFrames < 0 {
+		t.Errorf("Stats().BufferedFrames = %d; want 0 or more", s.BufferedFrames)
+	}
+	if s.Drift.Reports < 2 && s.Drift.Ratio != 0 {
+		t.Errorf("Stats().Drift = %+v; want Ratio 0 while fewer than two reports are in", s.Drift)
+	}
+}

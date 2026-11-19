@@ -73,6 +73,20 @@ type Mux struct {
 	playedFrame int64
 	playedAt    time.Time
 	reportedAt  time.Time
+
+	// driftFirst and driftLast are the first and the last accepted report of
+	// the span the drift statistics cover, and driftReports counts the
+	// accepted reports in it. They are guarded by playedMu.
+	driftFirst   driftReport
+	driftLast    driftReport
+	driftReports int64
+}
+
+// A driftReport is a report of when a frame of the mix is played, as the drift
+// statistics remember it.
+type driftReport struct {
+	frame int64
+	at    time.Time
 }
 
 // maxSentSpans is the most spans of the mix a player remembers its data went
@@ -197,6 +211,33 @@ func (m *Mux) SetPlayed(frame int64, at time.Time) {
 	m.playedFrame = frame
 	m.playedAt = at
 	m.reportedAt = now
+	m.recordDrift(frame, at)
+}
+
+// recordDrift folds a report into the drift statistics.
+//
+// When recordDrift is called, playedMu must be locked.
+func (m *Mux) recordDrift(frame int64, at time.Time) {
+	r := driftReport{frame: frame, at: at}
+	if m.driftReports > 0 {
+		switch {
+		case frame < m.driftLast.frame:
+			// The played frame went back, as on a seek: the reports before
+			// say nothing about the clock now, and the span restarts here.
+			m.driftFirst = r
+			m.driftLast = r
+			m.driftReports = 1
+			return
+		case frame == m.driftLast.frame || !at.After(m.driftLast.at):
+			// A report that moves neither the played frame nor its time
+			// carries no new rate information.
+			return
+		}
+	} else {
+		m.driftFirst = r
+	}
+	m.driftLast = r
+	m.driftReports++
 }
 
 // ClearPlayed clears the driver's last report.
@@ -205,6 +246,9 @@ func (m *Mux) ClearPlayed() {
 	defer m.playedMu.Unlock()
 
 	m.playedKnown = false
+	// The clock relation the drift statistics describe is broken, as the
+	// device is suspended, and the span restarts at the next report.
+	m.driftReports = 0
 }
 
 // played returns how many of the samples mixed have been played, and whether the
@@ -224,6 +268,69 @@ func (m *Mux) played() (int64, bool) {
 	// No more than is mixed has been played, as when the device has run dry
 	// since the report.
 	return min(frame*int64(m.channelCount), m.mixed.Load()), true
+}
+
+// Stats is a snapshot of how the mux observes playback: the water level of
+// the device buffer, and the drift of the device clock from the wall clock.
+type Stats struct {
+	// MixedFrames is the number of frames ReadFloat32s has mixed and sent to
+	// the driver.
+	MixedFrames int64
+
+	// PlayedKnown reports whether PlayedFrames and BufferedFrames are known:
+	// whether the driver reports when frames are played and its report holds.
+	PlayedKnown bool
+
+	// PlayedFrames is the number of mixed frames the device has played,
+	// extrapolated from the driver's last report. It is 0 when PlayedKnown is
+	// false.
+	PlayedFrames int64
+
+	// BufferedFrames is the water level: the frames mixed and sent to the
+	// driver but not played yet. It is 0 when PlayedKnown is false.
+	BufferedFrames int64
+
+	// Drift is the statistics of the device clock's deviation from the wall
+	// clock.
+	Drift DriftStats
+}
+
+// DriftStats is statistics of how fast the device clock runs against the wall
+// clock, over the span from the driver's first to its last accepted report.
+type DriftStats struct {
+	// Reports is the number of the driver's reports the span covers. The span
+	// restarts when the reports are cleared or the played frame goes back.
+	Reports int64
+
+	// Ratio is the device clock's rate over the span relative to the nominal
+	// sample rate: 1 when the clocks agree, above 1 when the device plays
+	// faster. It is computed from the span's ends, so it does not depend on
+	// how often the driver reports in between. It is 0 while fewer than two
+	// reports are in.
+	Ratio float64
+}
+
+// Stats returns a snapshot of how the mux observes playback.
+func (m *Mux) Stats() Stats {
+	s := Stats{
+		MixedFrames: m.mixed.Load() / int64(m.channelCount),
+	}
+	if played, ok := m.played(); ok {
+		s.PlayedKnown = true
+		s.PlayedFrames = played / int64(m.channelCount)
+		s.BufferedFrames = s.MixedFrames - s.PlayedFrames
+	}
+
+	m.playedMu.Lock()
+	reports, first, last := m.driftReports, m.driftFirst, m.driftLast
+	m.playedMu.Unlock()
+
+	s.Drift.Reports = reports
+	if reports >= 2 {
+		d := last.at.Sub(first.at)
+		s.Drift.Ratio = float64(last.frame-first.frame) * float64(time.Second) / (float64(d) * float64(m.sampleRate))
+	}
+	return s
 }
 
 // Stop stops the Mux from reading the players' sources.
