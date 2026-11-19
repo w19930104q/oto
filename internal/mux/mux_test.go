@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1407,5 +1408,100 @@ func TestSeekPreservesVolumeRamp(t *testing.T) {
 		if got != want {
 			t.Errorf("sample %d after Seek: got %v; want ramped %v", i, got, want)
 		}
+	}
+}
+
+// TestSmallCommitsKeepEverySample plays a source in small commits and checks
+// that every sample is played exactly once and in order.
+func TestSmallCommitsKeepEverySample(t *testing.T) {
+	m := mux.New(48000, 1, mux.FormatUnsignedInt8)
+	defer m.Stop()
+	p := newPlayer(t, m, &rampReader{})
+	p.SetBufferSize(8)
+	p.Play()
+
+	var played []byte
+	buf := make([]float32, 3)
+	deadline := time.Now().Add(10 * time.Second)
+	for len(played) < 4096 {
+		n := min(p.BufferedSize(), len(buf))
+		if n == 0 {
+			if time.Now().After(deadline) {
+				t.Fatalf("the player did not play enough data: got %d bytes; want %d", len(played), 4096)
+			}
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		m.ReadFloat32s(buf[:n])
+		for _, v := range buf[:n] {
+			played = append(played, byte(int(v*(1<<7))+(1<<7)))
+		}
+	}
+
+	for i, b := range played {
+		if b != byte(i) {
+			t.Fatalf("played[%d]: got %d; want %d (%d bytes were lost around here)", i, b, byte(i), int(b)-i)
+		}
+	}
+}
+
+// TestCommitDoesNotAllocate drives the commit path synchronously and checks
+// that committing read results, of varying sizes, does not allocate. A GC
+// before each commit flushes buffer pools, so a commit that relies on pooled
+// buffers would allocate.
+func TestCommitDoesNotAllocate(t *testing.T) {
+	const bufferSize = 8192
+
+	m := mux.New(48000, 2, mux.FormatSignedInt16LE)
+	p := newPlayer(t, m, &constReader{value: 64})
+	p.SetBufferSize(bufferSize)
+	p.Play()
+	waitForBufferedSize(t, p, bufferSize)
+	// Stop the mux loop so that only this test drives the commit path.
+	m.Stop()
+
+	// Consume alternating amounts so the commit sizes vary.
+	consumes := [][]float32{make([]float32, 32), make([]float32, 1024)}
+	var start int64
+	i := 0
+	allocs := testing.AllocsPerRun(200, func() {
+		runtime.GC()
+		consume := consumes[i%2]
+		i++
+		p.ReadBufferAndAdd(consume, start)
+		start += int64(len(consume))
+		p.ReadSourceToBuffer()
+	})
+	if allocs != 0 {
+		t.Errorf("the commit path allocates: got %v allocations per commit; want 0", allocs)
+	}
+}
+
+func BenchmarkSmallCommits(b *testing.B) {
+	const bufferSize = 8192
+
+	m := mux.New(48000, 2, mux.FormatSignedInt16LE)
+	p := m.NewPlayer(&constReader{value: 64})
+	defer func() {
+		_ = p.Close()
+	}()
+	p.SetBufferSize(bufferSize)
+	p.Play()
+	for p.BufferedSize() < bufferSize {
+		time.Sleep(time.Millisecond)
+	}
+	// Stop the mux loop so that only the benchmark drives the commit path.
+	m.Stop()
+
+	// Consume alternating amounts so the commit sizes vary.
+	consumes := [][]float32{make([]float32, 32), make([]float32, 1024)}
+	var start int64
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		consume := consumes[i%2]
+		p.ReadBufferAndAdd(consume, start)
+		start += int64(len(consume))
+		p.ReadSourceToBuffer()
 	}
 }

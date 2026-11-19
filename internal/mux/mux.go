@@ -388,25 +388,6 @@ func (p *playerImpl) setBufferSize(bufferSize int) {
 	}
 }
 
-var theBufPool = sync.Pool{
-	New: func() any {
-		var buf []byte
-		return &buf
-	},
-}
-
-func getBufferFromPool(size int) *[]byte {
-	buf := theBufPool.Get().(*[]byte)
-
-	if cap(*buf) < size {
-		*buf = make([]byte, size)
-	}
-
-	*buf = (*buf)[:size]
-
-	return buf
-}
-
 // playImpl starts playing without reading the source.
 // The buffer is filled by the mux loop.
 //
@@ -698,7 +679,7 @@ func (p *playerImpl) closeImpl() error {
 		return p.err
 	}
 	p.state = playerClosed
-	p.returnBufferToPool()
+	p.releaseBuffer()
 
 	// A pending source error stays in srcErr, and Reset on this closed player would still move it to err.
 	// This is left as it is: oto's Player.Close is deprecated and does nothing, so through oto a player is
@@ -794,7 +775,7 @@ func (p *playerImpl) readBufferAndAdd(buf []float32, start int64) int {
 
 	// A trailing partial sample can never be played and is dropped.
 	if p.drained() {
-		p.returnBufferToPool()
+		p.releaseBuffer()
 		p.state = playerPaused
 		p.mux.removePlayer(p)
 	}
@@ -817,33 +798,55 @@ func (p *playerImpl) canReadSourceToBuffer() bool {
 }
 
 func (p *playerImpl) readSourceToBuffer() int {
-	buf, gen := p.prepareSourceRead()
-	if buf == nil {
+	dst, off, gen := p.prepareSourceRead()
+	if dst == nil {
 		return 0
 	}
-	defer theBufPool.Put(buf)
 
-	n, err := p.src.Read(*buf)
-	return p.finishSourceRead(buf, gen, n, err)
+	n, err := p.src.Read(dst)
+	return p.finishSourceRead(dst, off, gen, n, err)
 }
 
-func (p *playerImpl) prepareSourceRead() (*[]byte, int) {
+// prepareSourceRead prepares a read from the source, and returns the slice to
+// read into, the offset of that slice in the player's buffer, and the source
+// generation. The returned slice is the spare capacity at the tail of the
+// player's own buffer, so the read needs no temporary buffer and its result is
+// committed without a copy or an allocation.
+func (p *playerImpl) prepareSourceRead() ([]byte, int, int) {
 	p.m.Lock()
 	defer p.m.Unlock()
 
 	if p.seeking || p.err != nil || p.srcErr != nil || p.state == playerClosed || p.state == playerPausedAndStopReading {
-		return nil, 0
+		return nil, 0, 0
 	}
-	if p.buffered() >= p.bufferSize {
-		return nil, 0
+	buffered := p.buffered()
+	if buffered >= p.bufferSize {
+		return nil, 0, 0
+	}
+	want := p.bufferSize - buffered
+
+	if cap(p.buf)-len(p.buf) < want {
+		// The read does not fit at the tail of the backing array. Compact the
+		// unconsumed bytes to the front to make room.
+		if p.readPos > 0 {
+			copy(p.buf, p.buf[p.readPos:])
+			p.buf = p.buf[:buffered]
+			p.readPos = 0
+		}
+		if cap(p.buf)-len(p.buf) < want {
+			// The buffer size grew beyond the capacity. Grow the buffer.
+			buf := make([]byte, len(p.buf), len(p.buf)+want)
+			copy(buf, p.buf)
+			p.buf = buf
+		}
 	}
 
-	buf := getBufferFromPool(p.bufferSize - p.buffered())
+	off := len(p.buf)
 	p.reading = true
-	return buf, p.srcGen
+	return p.buf[off : off+want], off, p.srcGen
 }
 
-func (p *playerImpl) finishSourceRead(buf *[]byte, gen, n int, err error) int {
+func (p *playerImpl) finishSourceRead(dst []byte, off, gen, n int, err error) int {
 	p.m.Lock()
 	defer p.m.Unlock()
 
@@ -855,26 +858,30 @@ func (p *playerImpl) finishSourceRead(buf *[]byte, gen, n int, err error) int {
 		return 0
 	}
 
-	if p.buf == nil {
-		p.buf = (*getBufferFromPool(p.bufferSize))[:0]
+	// Commit the read result. The source wrote into the spare capacity at the
+	// tail of the buffer, so committing only re-slices the buffer.
+	switch {
+	case p.buf == nil:
+		// The buffer was released while reading, as the player had reached the
+		// end of the source and drained. The read data still sits where the
+		// old buffer's tail was, and dst references it.
+		p.buf = dst[:n]
 		p.readPos = 0
+	case len(p.buf) == off:
+		// The buffered data still precedes the read data.
+		p.buf = p.buf[:off+n]
+	default:
+		// The mixer consumed the whole buffer and reset it while reading.
+		// The read data sits at the old tail.
+		p.buf = p.buf[:off+n]
+		p.readPos = off
 	}
 
-	// Compact the unconsumed bytes to the front when the read result does not
-	// fit at the tail of the backing array.
-	buffered := p.buffered()
-	if p.readPos > 0 && len(p.buf)+n > cap(p.buf) {
-		copy(p.buf, p.buf[p.readPos:])
-		p.buf = p.buf[:buffered]
-		p.readPos = 0
-	}
-
-	p.buf = append(p.buf, (*buf)[:n]...)
 	switch {
 	case err == io.EOF:
 		p.eof = true
 		if p.drained() {
-			p.returnBufferToPool()
+			p.releaseBuffer()
 			if p.state == playerPlay {
 				p.state = playerPaused
 			}
@@ -912,12 +919,11 @@ func (p *playerImpl) setErrorImpl(err error) {
 	p.closeImpl()
 }
 
-func (p *playerImpl) returnBufferToPool() {
-	if p.buf != nil {
-		buf := p.buf
-		theBufPool.Put(&buf)
-		p.buf = nil
-	}
+// releaseBuffer releases the player's buffer.
+//
+// When releaseBuffer is called, the mutex m must be locked.
+func (p *playerImpl) releaseBuffer() {
+	p.buf = nil
 	p.readPos = 0
 }
 

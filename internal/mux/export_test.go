@@ -21,3 +21,15 @@ func (p *Player) IsRegistered() bool {
 	_, ok := p.p.mux.players[p.p]
 	return ok
 }
+
+// ReadSourceToBuffer reads from the player's source into its buffer once, as
+// the mux loop does.
+func (p *Player) ReadSourceToBuffer() int {
+	return p.p.readSourceToBuffer()
+}
+
+// ReadBufferAndAdd adds the player's buffered data to buf, which goes into the
+// mix from sample start, as the mixer does.
+func (p *Player) ReadBufferAndAdd(buf []float32, start int64) int {
+	return p.p.readBufferAndAdd(buf, start)
+}
