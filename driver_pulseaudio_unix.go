@@ -86,7 +86,7 @@ func newPulseContext(sampleRate int, channelCount int, mux *mux.Mux, bufferSizeI
 	}
 	options = append(options, pulse.PlaybackSampleRate(sampleRate))
 	{
-		latency := float64(bufferSizeInBytes) / float64(sampleRate*channelCount*4)
+		latency := float64(bufferSizeInBytes) / (float64(sampleRate) * float64(channelCount) * 4)
 		if latency <= 0 {
 			// If no buffer size is specified, default to a 100ms latency.
 			// Without this, PulseAudio uses its own large default buffer (~2s),

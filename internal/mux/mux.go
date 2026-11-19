@@ -927,7 +927,11 @@ func (p *playerImpl) returnBufferToPool() {
 // The mux loop reads the source into this buffer, and ReadFloat32s consumes it.
 func (m *Mux) defaultBufferSize() int {
 	bytesPerSample := m.channelCount * m.format.ByteLength()
-	s := m.sampleRate * bytesPerSample / 2 // 0.5[s]
-	// Align s in multiples of bytes per sample, or a buffer could have extra bytes.
-	return s / bytesPerSample * bytesPerSample
+	const maxInt = int(^uint(0) >> 1)
+	// Half a second of samples, aligned down to whole samples.
+	frames := int64(m.sampleRate) / 2
+	if frames > int64(maxInt/bytesPerSample) {
+		frames = int64(maxInt / bytesPerSample)
+	}
+	return int(frames) * bytesPerSample
 }

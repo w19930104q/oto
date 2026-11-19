@@ -75,6 +75,9 @@ type NewContextOptions struct {
 	// Set BufferSize to adjust the buffer size if you want to adjust latency or reduce noise.
 	// A buffer size that is too big increases the latency.
 	// On the other hand, a buffer size that is too small can cause glitch noises due to buffer shortage.
+	//
+	// BufferSize must be large enough for at least one whole frame at the given SampleRate.
+	// A smaller value makes NewContext return an error.
 	BufferSize time.Duration
 
 	// ApplicationName specifies the name of the client application.
@@ -140,6 +143,9 @@ func durationToBufferSize(duration time.Duration, sampleRate, channelCount int) 
 	frames, ok := mathutil.MulDiv(int64(duration), int64(sampleRate), int64(time.Second))
 	if !ok || frames > int64(maxInt/bytesPerFrame) {
 		return 0, fmt.Errorf("oto: buffer size exceeds int range")
+	}
+	if frames == 0 {
+		return 0, fmt.Errorf("oto: buffer size is too small for the sample rate: %s at %d Hz yields no whole frame", duration, sampleRate)
 	}
 	return int(frames) * bytesPerFrame, nil
 }

@@ -17,6 +17,7 @@ package oto
 import (
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 	"syscall"
@@ -342,6 +343,13 @@ func (c *wasapiContext) startOnCOMThread() (ferr error) {
 	// Fallback to WinMM in this case anyway.
 	const bitsPerSample = 32
 	nBlockAlign := c.channelCount * bitsPerSample / 8
+	if int64(c.sampleRate) > math.MaxUint32 {
+		return fmt.Errorf("oto: sample rate cannot be represented as uint32: %d", c.sampleRate)
+	}
+	avgBytesPerSec, ok := mathutil.MulDiv(int64(c.sampleRate), int64(nBlockAlign), 1)
+	if !ok || avgBytesPerSec > math.MaxUint32 {
+		return fmt.Errorf("oto: sample rate %d with %d channels exceeds the representable byte rate", c.sampleRate, c.channelCount)
+	}
 	var channelMask uint32
 	switch c.channelCount {
 	case 1:
@@ -353,7 +361,7 @@ func (c *wasapiContext) startOnCOMThread() (ferr error) {
 		wFormatTag:      _WAVE_FORMAT_EXTENSIBLE,
 		nChannels:       uint16(c.channelCount),
 		nSamplesPerSec:  uint32(c.sampleRate),
-		nAvgBytesPerSec: uint32(c.sampleRate * nBlockAlign),
+		nAvgBytesPerSec: uint32(avgBytesPerSec),
 		nBlockAlign:     uint16(nBlockAlign),
 		wBitsPerSample:  bitsPerSample,
 		cbSize:          0x16,

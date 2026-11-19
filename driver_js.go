@@ -74,6 +74,9 @@ func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeI
 		// 4096 was not great at least on Safari 15.
 		bufferSizeInBytes = 8192 * channelCount
 	}
+	if bufferSizeInBytes < 4*channelCount {
+		return nil, nil, fmt.Errorf("oto: buffer size is too small: %d bytes must make at least one frame of %d bytes", bufferSizeInBytes, 4*channelCount)
+	}
 
 	buf32 := make([]float32, bufferSizeInBytes/4)
 	var moduleReady bool

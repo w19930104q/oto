@@ -253,6 +253,9 @@ Status Stream::OpenLocked() {
       ->setErrorCallback(this);
   if (buffer_size_in_bytes_) {
     int buffer_size_in_frames = buffer_size_in_bytes_ / channel_num_ / 4;
+    if (buffer_size_in_frames < 1) {
+      return Status{"buffer size in bytes must make at least one frame", false};
+    }
     builder.setBufferCapacityInFrames(buffer_size_in_frames);
   }
   oboe::Result result = builder.openStream(stream_);

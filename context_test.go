@@ -64,6 +64,21 @@ func TestDurationToBufferSize(t *testing.T) {
 			duration:     time.Nanosecond,
 			sampleRate:   48000,
 			channelCount: 2,
+			wantErr:      true,
+		},
+		{
+			name:         "sub-nanosecond cannot be a duration",
+			duration:     time.Nanosecond,
+			sampleRate:   1,
+			channelCount: 1,
+			wantErr:      true,
+		},
+		{
+			name:         "exactly one frame",
+			duration:     time.Second / 1000,
+			sampleRate:   1000,
+			channelCount: 2,
+			want:         8,
 		},
 		{
 			name:         "seven hours",
@@ -107,7 +122,7 @@ func TestDurationToBufferSize(t *testing.T) {
 			duration:     time.Nanosecond,
 			sampleRate:   maxInt,
 			channelCount: 2,
-			want:         int64(maxInt) / int64(time.Second) * 8,
+			want:         (int64(maxInt) / int64(time.Second)) * 8,
 		},
 		{
 			name:         "large sample rate",
@@ -179,6 +194,76 @@ func TestDurationToBufferSize(t *testing.T) {
 			}
 			if int64(got) != tt.want {
 				t.Errorf("DurationToBufferSize = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNewContextRejectsInvalidOptions covers the boundary combinations that
+// cannot produce playable output: they must fail with an error rather than
+// silently clamping to a different buffer or producing corrupted output.
+func TestNewContextRejectsInvalidOptions(t *testing.T) {
+	tests := []struct {
+		name    string
+		options oto.NewContextOptions
+	}{
+		{
+			name: "non-positive sample rate",
+			options: oto.NewContextOptions{
+				SampleRate:   0,
+				ChannelCount: 2,
+				Format:       oto.FormatFloat32LE,
+			},
+		},
+		{
+			name: "unsupported channel count",
+			options: oto.NewContextOptions{
+				SampleRate:   48000,
+				ChannelCount: 3,
+				Format:       oto.FormatFloat32LE,
+			},
+		},
+		{
+			name: "negative buffer size",
+			options: oto.NewContextOptions{
+				SampleRate:   48000,
+				ChannelCount: 2,
+				Format:       oto.FormatFloat32LE,
+				BufferSize:   -time.Millisecond,
+			},
+		},
+		{
+			name: "buffer duration too small for one frame",
+			options: oto.NewContextOptions{
+				SampleRate:   48000,
+				ChannelCount: 2,
+				Format:       oto.FormatFloat32LE,
+				BufferSize:   time.Nanosecond,
+			},
+		},
+		{
+			name: "sub-frame buffer at extreme sample rate",
+			options: oto.NewContextOptions{
+				SampleRate:   192000,
+				ChannelCount: 2,
+				Format:       oto.FormatFloat32LE,
+				BufferSize:   100 * time.Nanosecond,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// NewContext validates the options before registering the one-time
+			// global context, so rejected calls do not consume it.
+			ctx, ready, err := oto.NewContext(&tt.options)
+			if err == nil {
+				t.Errorf("NewContext succeeded for an unsupported combination: %+v", tt.options)
+				if ready != nil {
+					<-ready
+				}
+				if ctx != nil {
+					_ = ctx.Suspend()
+				}
 			}
 		})
 	}

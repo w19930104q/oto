@@ -69,6 +69,9 @@ func newAudioQueue(sampleRate, channelCount int, oneBufferSizeInBytes int) (_Aud
 	bufs := make([]_AudioQueueBufferRef, 0, bufferCount)
 	for len(bufs) < cap(bufs) {
 		var buf _AudioQueueBufferRef
+		if oneBufferSizeInBytes <= 0 {
+			return 0, nil, fmt.Errorf("oto: AudioQueue buffer size must be positive: %d", oneBufferSizeInBytes)
+		}
 		if osstatus := _AudioQueueAllocateBuffer(audioQueue, uint32(oneBufferSizeInBytes), &buf); osstatus != noErr {
 			// Disposing the queue also frees the buffers allocated so far.
 			_ = _AudioQueueDispose(audioQueue, true)
@@ -174,6 +177,19 @@ const timeStampValid = kAudioTimeStampSampleTimeValid | kAudioTimeStampHostTimeV
 
 var theContext *context
 
+// darwinOneBufferSizeInBytes splits the total device buffer size over the
+// bufferCount AudioQueue buffers and rounds down to whole frames. A size that
+// would leave less than one frame per queue buffer is rejected instead of
+// becoming a zero-size AudioQueue buffer, which the queue cannot play.
+func darwinOneBufferSizeInBytes(bufferSizeInBytes, channelCount int) (int, error) {
+	bytesPerFrame := channelCount * float32SizeInBytes
+	oneBufferSizeInBytes := bufferSizeInBytes / bufferCount / bytesPerFrame * bytesPerFrame
+	if oneBufferSizeInBytes < bytesPerFrame {
+		return 0, fmt.Errorf("oto: buffer size is too small: %d bytes must make at least one frame per one of the %d queue buffers", bufferSizeInBytes, bufferCount)
+	}
+	return oneBufferSizeInBytes, nil
+}
+
 func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeInBytes int, _ string) (*context, chan struct{}, error) {
 	// defaultOneBufferSizeInBytes is the default buffer size in bytes.
 	//
@@ -184,12 +200,14 @@ func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeI
 
 	var oneBufferSizeInBytes int
 	if bufferSizeInBytes != 0 {
-		oneBufferSizeInBytes = bufferSizeInBytes / bufferCount
+		size, err := darwinOneBufferSizeInBytes(bufferSizeInBytes, channelCount)
+		if err != nil {
+			return nil, nil, err
+		}
+		oneBufferSizeInBytes = size
 	} else {
 		oneBufferSizeInBytes = defaultOneBufferSizeInBytes
 	}
-	bytesPerSample := channelCount * 4
-	oneBufferSizeInBytes = oneBufferSizeInBytes / bytesPerSample * bytesPerSample
 
 	ready := make(chan struct{})
 

@@ -17,12 +17,14 @@ package oto
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 
+	"github.com/ebitengine/oto/v3/internal/mathutil"
 	"github.com/ebitengine/oto/v3/internal/mux"
 )
 
@@ -115,11 +117,18 @@ func newWinMMContext(sampleRate, channelCount int, mux *mux.Mux, bufferSizeInByt
 func (c *winmmContext) start() error {
 	const bitsPerSample = 32
 	nBlockAlign := c.channelCount * bitsPerSample / 8
+	if int64(c.sampleRate) > math.MaxUint32 {
+		return fmt.Errorf("oto: sample rate cannot be represented as uint32: %d", c.sampleRate)
+	}
+	avgBytesPerSec, ok := mathutil.MulDiv(int64(c.sampleRate), int64(nBlockAlign), 1)
+	if !ok || avgBytesPerSec > math.MaxUint32 {
+		return fmt.Errorf("oto: sample rate %d with %d channels exceeds the representable byte rate", c.sampleRate, c.channelCount)
+	}
 	f := &_WAVEFORMATEX{
 		wFormatTag:      _WAVE_FORMAT_IEEE_FLOAT,
 		nChannels:       uint16(c.channelCount),
 		nSamplesPerSec:  uint32(c.sampleRate),
-		nAvgBytesPerSec: uint32(c.sampleRate * nBlockAlign),
+		nAvgBytesPerSec: uint32(avgBytesPerSec),
 		nBlockAlign:     uint16(nBlockAlign),
 		wBitsPerSample:  bitsPerSample,
 	}
