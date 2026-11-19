@@ -42,7 +42,7 @@ type context struct {
 	err   atomicError
 }
 
-func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeInBytes int, applicationName string) (*context, chan struct{}, error) {
+func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeInBytes int, applicationName string, _ bool) (*context, chan struct{}, error) {
 	ctx := &context{
 		mux:   mux.New(sampleRate, channelCount, format),
 		ready: make(chan struct{}),
@@ -89,6 +89,11 @@ func (c *context) Resume() error {
 		return c.backend.Resume()
 	}
 	return nil
+}
+
+// latencyStats returns the measured latency. The Unix backends do not record it yet.
+func (c *context) latencyStats() LatencyStats {
+	return LatencyStats{}
 }
 
 func (c *context) Err() error {

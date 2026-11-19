@@ -259,6 +259,13 @@ func (m *Mux) ReadFloat32s(buf []float32) {
 	m.signal()
 }
 
+// Mixed returns the total number of float32 samples ReadFloat32s has produced,
+// across every device the mux has fed. A driver that drains the mux while its
+// device is unavailable therefore advances this count like any other read.
+func (m *Mux) Mixed() int64 {
+	return m.mixed.Load()
+}
+
 type Player struct {
 	p       *playerImpl
 	cleanup runtime.Cleanup

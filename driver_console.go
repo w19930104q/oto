@@ -46,7 +46,7 @@ type context struct {
 
 var theContext *context
 
-func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeInBytes int, _ string) (*context, chan struct{}, error) {
+func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeInBytes int, _ string, _ bool) (*context, chan struct{}, error) {
 	ready := make(chan struct{})
 	close(ready)
 
@@ -69,6 +69,11 @@ func (c *context) Suspend() error {
 func (c *context) Resume() error {
 	// Do nothing so far.
 	return nil
+}
+
+// latencyStats returns the measured latency. The console backend does not record it yet.
+func (c *context) latencyStats() LatencyStats {
+	return LatencyStats{}
 }
 
 func (c *context) Err() error {

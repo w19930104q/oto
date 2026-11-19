@@ -77,6 +77,21 @@ type NewContextOptions struct {
 	// On the other hand, a buffer size that is too small can cause glitch noises due to buffer shortage.
 	BufferSize time.Duration
 
+	// LowLatency requests a low-latency commit mode on drivers that support it.
+	//
+	// In low-latency mode the driver is driven by the device's own events and
+	// commits only enough audio to stay within a small latency budget, so the
+	// time from writing a sample to hearing it is bounded instead of filling
+	// the whole device buffer. If the process cannot keep the device's
+	// deadlines, the driver automatically raises the budget to keep the audio
+	// flowing, and lowers it again once the deadlines are met again. The
+	// produced audio samples are identical to the regular mode; only the amount
+	// buffered ahead of the device changes.
+	//
+	// On drivers without a low-latency mode the option is accepted without
+	// effect. The zero value keeps the regular, unchanged commit path.
+	LowLatency bool
+
 	// ApplicationName specifies the name of the client application.
 	// It is used for PulseAudio's volume control UI and so on.
 	ApplicationName string
@@ -115,7 +130,7 @@ func NewContext(options *NewContextOptions) (*Context, chan struct{}, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	ctx, ready, err := newContext(options.SampleRate, options.ChannelCount, mux.Format(options.Format), bufferSizeInBytes, options.ApplicationName)
+	ctx, ready, err := newContext(options.SampleRate, options.ChannelCount, mux.Format(options.Format), bufferSizeInBytes, options.ApplicationName, options.LowLatency)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -207,6 +222,86 @@ func (c *Context) Resume() error {
 // Err is concurrent-safe.
 func (c *Context) Err() error {
 	return c.context.Err()
+}
+
+// LatencyDistribution summarizes a sample of latency measurements.
+type LatencyDistribution struct {
+	// Count is the number of measurements the summary is based on.
+	Count int64
+
+	// Min is the smallest measured duration.
+	Min time.Duration
+
+	// Mean is the arithmetic mean of the measured durations.
+	Mean time.Duration
+
+	// P95 is the 95th percentile of the measured durations.
+	P95 time.Duration
+
+	// Max is the largest measured duration.
+	Max time.Duration
+}
+
+// LatencyStats reports the latency the audio driver produced.
+//
+// All fields are safe to read while audio is playing. The distributions are
+// sampled with a bounded reservoir, so long-running processes keep a
+// representative, uniformly random subset of measurements rather than growing
+// without bound.
+type LatencyStats struct {
+	// LowLatency reports whether the driver is running the low-latency commit
+	// mode requested with NewContextOptions.LowLatency. It is false on drivers
+	// that do not support the mode.
+	LowLatency bool
+
+	// CommitLatency is the time from the device signaling that it is ready for
+	// more audio to the driver finishing writing it. A large value means the
+	// render thread was scheduled late. In the regular commit mode this delay
+	// is not bounded; in low-latency mode the driver reacts to each device
+	// event directly.
+	CommitLatency LatencyDistribution
+
+	// OutputLatency is the amount of audio already handed to the device but
+	// not yet played, measured after each commit, i.e. the audible latency.
+	OutputLatency LatencyDistribution
+
+	// Underruns is the number of times the device buffer had run dry when the
+	// driver was finally able to commit, meaning a deadline was missed.
+	Underruns int64
+
+	// Degradations is the number of times the low-latency driver raised its
+	// latency budget to keep the stream flowing after an underrun. It is zero
+	// outside low-latency mode.
+	Degradations int64
+
+	// Recoveries is the number of times a raised budget returned to its
+	// nominal value after the deadlines were met again.
+	Recoveries int64
+
+	// TargetLatency is the output latency the low-latency driver currently
+	// aims for. It grows on degradation and shrinks on recovery.
+	TargetLatency time.Duration
+
+	// PeakTargetLatency is the deepest degraded target reached since the
+	// context was created.
+	PeakTargetLatency time.Duration
+
+	// NominalLatency is the latency budget the low-latency driver started with
+	// and tries to return to after a degradation.
+	NominalLatency time.Duration
+
+	// MaxLatency is the largest latency the degraded budget can reach.
+	MaxLatency time.Duration
+}
+
+// Latency returns the latency statistics measured by the audio driver.
+//
+// On drivers that do not measure latency, the returned LatencyStats has its
+// distributions at their zero values and LowLatency false.
+//
+// Latency is concurrent-safe.
+func (c *Context) Latency() LatencyStats {
+	return c.context.latencyStats()
 }
 
 type atomicError struct {

@@ -25,6 +25,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
+	"github.com/ebitengine/oto/v3/internal/latencyctl"
 	"github.com/ebitengine/oto/v3/internal/mathutil"
 	"github.com/ebitengine/oto/v3/internal/mux"
 )
@@ -106,6 +107,7 @@ type wasapiContext struct {
 	channelCount      int
 	mux               *mux.Mux
 	bufferSizeInBytes int
+	lowLatency        bool
 
 	comThread     *comThread
 	err           atomicError
@@ -119,6 +121,28 @@ type wasapiContext struct {
 	currentDeviceID  string
 	enumerator       *_IMMDeviceEnumerator
 	oomRetryCount    int
+
+	// devicePeriod is the interval between the device's ready events, captured
+	// at initialization in low-latency mode.
+	devicePeriod time.Duration
+
+	// controller drives the low-latency commit policy and holds its statistics.
+	controller *latencyctl.Controller
+
+	// latencyRecorder is kept for the whole context lifetime and shared by every
+	// controller created across device restarts, so the latency statistics are
+	// not reset when the device is re-acquired.
+	latencyRecorder *latencyctl.Recorder
+
+	// recorder collects latency statistics in the regular commit path, so both
+	// modes can be accepted against the same measurements.
+	recorder latencyctl.Recorder
+
+	// committedMixed is the mux's global sample index just after the last
+	// commit. Together with the device padding it yields the frame currently
+	// playing, and stays correct across a device restart because the mux keeps
+	// counting while the device is drained.
+	committedMixed int64
 
 	buf []float32
 
@@ -142,9 +166,31 @@ const (
 	// draining continues at real time regardless.
 	wasapiReacquireMinInterval = 50 * time.Millisecond
 	wasapiReacquireMaxInterval = 500 * time.Millisecond
+
+	// wasapiLowLatencyMinBuffer and wasapiLowLatencyMaxBuffer bound the device
+	// buffer requested in low-latency mode. Three device periods (typically
+	// ~30ms) leave one period of headroom over the nominal two-period budget.
+	wasapiLowLatencyMinBuffer = 20 * time.Millisecond
+	wasapiLowLatencyMaxBuffer = 50 * time.Millisecond
 )
 
-func newWASAPIContext(sampleRate, channelCount int, mux *mux.Mux, bufferSizeInBytes int) (context *wasapiContext, ferr error) {
+// wasapiLowLatencyBudgets returns the nominal and maximum latency budgets for
+// low-latency mode, derived from the device's signaling period. The nominal
+// budget keeps two periods queued; the maximum, used after degradation, is the
+// whole device buffer.
+func wasapiLowLatencyBudgets(period time.Duration) (nominal, max time.Duration) {
+	nominal = 2 * period
+	if nominal < wasapiLowLatencyMinBuffer {
+		nominal = wasapiLowLatencyMinBuffer
+	}
+	max = wasapiLowLatencyMaxBuffer
+	if max < nominal {
+		max = nominal
+	}
+	return nominal, max
+}
+
+func newWASAPIContext(sampleRate, channelCount int, mux *mux.Mux, bufferSizeInBytes int, lowLatency bool) (context *wasapiContext, ferr error) {
 	t, err := newCOMThread()
 	if err != nil {
 		return nil, err
@@ -155,8 +201,12 @@ func newWASAPIContext(sampleRate, channelCount int, mux *mux.Mux, bufferSizeInBy
 		channelCount:      channelCount,
 		mux:               mux,
 		bufferSizeInBytes: bufferSizeInBytes,
+		lowLatency:        lowLatency,
 		comThread:         t,
 		suspendedCond:     sync.NewCond(&sync.Mutex{}),
+	}
+	if lowLatency {
+		c.latencyRecorder = &latencyctl.Recorder{}
 	}
 
 	defer func() {
@@ -363,7 +413,40 @@ func (c *wasapiContext) startOnCOMThread() (ferr error) {
 	}
 
 	var bufferSizeIn100ns _REFERENCE_TIME
-	if c.bufferSizeInBytes != 0 {
+	if c.lowLatency {
+		// In low-latency mode the device's own period drives the commits, so
+		// size the buffer from it rather than from the fixed 50ms default.
+		defaultPeriod, _, err := c.client.GetDevicePeriod()
+		if err != nil {
+			return err
+		}
+		period := time.Duration(defaultPeriod) * 100
+		if period <= 0 {
+			period = 10 * time.Millisecond
+		}
+		c.devicePeriod = period
+
+		bufferDuration := 3 * period
+		if bufferDuration < wasapiLowLatencyMinBuffer {
+			bufferDuration = wasapiLowLatencyMinBuffer
+		}
+		if bufferDuration > wasapiLowLatencyMaxBuffer {
+			bufferDuration = wasapiLowLatencyMaxBuffer
+		}
+		// A caller-supplied BufferSize still caps the buffer in low-latency
+		// mode, so an explicit small BufferSize keeps honoring the request.
+		if c.bufferSizeInBytes != 0 {
+			bufferSizeInFrames := int64(c.bufferSizeInBytes) / int64(nBlockAlign)
+			requested, ok := mathutil.MulDiv(bufferSizeInFrames, 1e7, int64(c.sampleRate))
+			if !ok {
+				return fmt.Errorf("oto: WASAPI buffer duration is unrepresentable")
+			}
+			if d := time.Duration(requested) * 100; d < bufferDuration {
+				bufferDuration = d
+			}
+		}
+		bufferSizeIn100ns = _REFERENCE_TIME(bufferDuration / 100)
+	} else if c.bufferSizeInBytes != 0 {
 		bufferSizeInFrames := int64(c.bufferSizeInBytes) / int64(nBlockAlign)
 		duration, ok := mathutil.MulDiv(bufferSizeInFrames, 1e7, int64(c.sampleRate))
 		if !ok {
@@ -392,6 +475,20 @@ func (c *wasapiContext) startOnCOMThread() (ferr error) {
 		return err
 	}
 	c.bufferFrames = frames
+
+	if c.lowLatency {
+		nominal, maxLatency := wasapiLowLatencyBudgets(c.devicePeriod)
+		// The maximum budget cannot exceed the buffer the device granted.
+		if maxFrames := time.Duration(frames) * time.Second / time.Duration(c.sampleRate); maxLatency > maxFrames {
+			maxLatency = maxFrames
+		}
+		// A device restart re-enters here with a new device but the same
+		// long-lived recorder, so the latency samples accumulate across
+		// acquisitions; Adopt carries over the degradation counters.
+		prev := c.controller
+		c.controller = latencyctl.NewControllerWithRecorder(c.sampleRate, c.devicePeriod, int(frames), nominal, maxLatency, c.latencyRecorder)
+		c.controller.Adopt(prev)
+	}
 
 	renderClient, err := c.client.GetService(&uuidIAudioRenderClient)
 	if err != nil {
@@ -450,8 +547,17 @@ func (c *wasapiContext) loopOnRenderThread() error {
 		}
 
 		if evt == windows.WAIT_OBJECT_0 {
-			if err := c.writeOnRenderThread(); err != nil {
-				return err
+			// The timestamp is taken before the commit so the recorded commit
+			// latency measures the scheduling and mixing delay itself.
+			eventAt := time.Now()
+			if c.lowLatency {
+				if err := c.writeLowLatencyOnRenderThread(eventAt); err != nil {
+					return err
+				}
+			} else {
+				if err := c.writeOnRenderThread(eventAt); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -470,7 +576,11 @@ func (c *wasapiContext) loopOnRenderThread() error {
 	}
 }
 
-func (c *wasapiContext) writeOnRenderThread() error {
+// writeOnRenderThread is the regular commit path: it fills every free frame of
+// the device buffer. Its behavior is unchanged by the low-latency feature; the
+// only addition is latency measurement, which is kept separate from the commit
+// decision.
+func (c *wasapiContext) writeOnRenderThread(eventAt time.Time) error {
 	c.m.Lock()
 	defer c.m.Unlock()
 
@@ -487,6 +597,62 @@ func (c *wasapiContext) writeOnRenderThread() error {
 	}
 	frames := c.bufferFrames - paddingFrames
 
+	if err := c.commitFrames(frames); err != nil {
+		return err
+	}
+
+	queued := paddingFrames + frames
+	c.reportPlayed(paddingFrames)
+	c.recorder.RecordCommit(time.Since(eventAt), c.framesToDuration(int64(queued)))
+	return nil
+}
+
+// writeLowLatencyOnRenderThread is the event-driven low-latency path. The
+// controller decides how many frames keep the queued audio within the latency
+// budget; an event at which the budget is already full commits nothing, so the
+// mux is not drained and the audible latency stays bounded.
+func (c *wasapiContext) writeLowLatencyOnRenderThread(eventAt time.Time) error {
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	paddingFrames, err := c.client.GetCurrentPadding()
+	if err != nil {
+		return err
+	}
+	if paddingFrames >= c.bufferFrames {
+		return nil
+	}
+
+	frames64 := c.controller.FramesToCommit(int64(paddingFrames))
+	if frames64 <= 0 {
+		// The water is still within the budget. Record the event anyway so the
+		// commit-latency distribution reflects every device wakeup, and report
+		// the current played position.
+		c.reportPlayed(paddingFrames)
+		c.controller.RecordCommit(time.Since(eventAt), int64(paddingFrames))
+		return nil
+	}
+	// Defensive clamp: the controller already bounds this to the free space,
+	// but never hand GetBuffer more than the device can accept regardless.
+	if frames64 > int64(c.bufferFrames)-int64(paddingFrames) {
+		frames64 = int64(c.bufferFrames) - int64(paddingFrames)
+	}
+	frames := uint32(frames64)
+
+	if err := c.commitFrames(frames); err != nil {
+		return err
+	}
+
+	queued := paddingFrames + frames
+	c.reportPlayed(paddingFrames)
+	c.controller.RecordCommit(time.Since(eventAt), int64(queued))
+	return nil
+}
+
+// commitFrames mixes frames from the mux and releases them to the device. The
+// caller holds c.m. A successful commit advances the written-frame counter and
+// resets the consecutive OOM counter.
+func (c *wasapiContext) commitFrames(frames uint32) error {
 	// Get the destination buffer.
 	dstBuf, err := c.renderClient.GetBuffer(frames)
 	if err != nil {
@@ -512,8 +678,77 @@ func (c *wasapiContext) writeOnRenderThread() error {
 	}
 
 	c.buf = c.buf[:0]
+	// ReadFloat32s advanced the mux's global sample count by exactly the
+	// committed number of samples (frames times channels).
+	c.committedMixed = c.mux.Mixed()
 	c.oomRetryCount = 0
 	return nil
+}
+
+// reportPlayed tells the mux which sample of the mix is currently playing.
+// paddingFrames is the amount still queued in the device, so the played sample
+// is the last committed one minus that padding. The mux keeps counting while a
+// device is restarted and drained, so no rebase is needed across restarts.
+//
+// The report is dropped while suspended, mirroring how the other drivers
+// invalidate stale playback positions.
+func (c *wasapiContext) reportPlayed(paddingFrames uint32) {
+	if c.isSuspended() {
+		c.mux.ClearPlayed()
+		return
+	}
+	frame := c.committedMixed - int64(paddingFrames)*int64(c.channelCount)
+	if frame < 0 {
+		frame = 0
+	}
+	c.mux.SetPlayed(frame, time.Now())
+}
+
+// framesToDuration converts a device-frame count to its playback duration.
+func (c *wasapiContext) framesToDuration(frames int64) time.Duration {
+	if frames <= 0 {
+		return 0
+	}
+	return time.Duration((frames*int64(time.Second) + int64(c.sampleRate)/2) / int64(c.sampleRate))
+}
+
+// latencyStats returns the measured latency for the active commit mode.
+func (c *wasapiContext) latencyStats() LatencyStats {
+	if c.lowLatency {
+		c.m.Lock()
+		controller := c.controller
+		c.m.Unlock()
+		if controller == nil {
+			return LatencyStats{LowLatency: true}
+		}
+		return fromLatencyCtlStats(controller.Snapshot())
+	}
+	return fromLatencyCtlStats(c.recorder.Snapshot(false, 0, 0, 0, 0, 0, 0))
+}
+
+func fromLatencyCtlStats(s latencyctl.Stats) LatencyStats {
+	return LatencyStats{
+		LowLatency:        s.LowLatency,
+		CommitLatency:     fromLatencyCtlDistribution(s.CommitLatency),
+		OutputLatency:     fromLatencyCtlDistribution(s.OutputLatency),
+		Underruns:         s.Underruns,
+		Degradations:      s.Degradations,
+		Recoveries:        s.Recoveries,
+		TargetLatency:     s.TargetLatency,
+		PeakTargetLatency: s.PeakTargetLatency,
+		NominalLatency:    s.NominalLatency,
+		MaxLatency:        s.MaxLatency,
+	}
+}
+
+func fromLatencyCtlDistribution(d latencyctl.Distribution) LatencyDistribution {
+	return LatencyDistribution{
+		Count: d.Count,
+		Min:   d.Min,
+		Mean:  d.Mean,
+		P95:   d.P95,
+		Max:   d.Max,
+	}
 }
 
 func (c *wasapiContext) Suspend() error {
@@ -522,6 +757,9 @@ func (c *wasapiContext) Suspend() error {
 	c.suspendedCond.L.Unlock()
 	c.suspendedCond.Signal()
 
+	// Nothing is playing while suspended, so a stale played position must not
+	// survive until the next report.
+	c.mux.ClearPlayed()
 	return nil
 }
 
@@ -589,6 +827,14 @@ func (c *wasapiContext) restart() error {
 		if now := time.Now(); !now.Before(nextReacquire) {
 			err := c.initialize()
 			if err == nil {
+				// The old device buffer was discarded and the mux kept being
+				// drained during the outage, so any playback report measured
+				// before the restart is stale. committedMixed is re-anchored on
+				// the first commit of the new device.
+				c.m.Lock()
+				c.committedMixed = c.mux.Mixed()
+				c.m.Unlock()
+				c.mux.ClearPlayed()
 				return nil
 			}
 			if !isWASAPIDeviceTransientError(err) {

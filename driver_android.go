@@ -29,7 +29,7 @@ type context struct {
 	m sync.Mutex
 }
 
-func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeInBytes int, _ string) (*context, chan struct{}, error) {
+func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeInBytes int, _ string, _ bool) (*context, chan struct{}, error) {
 	ready := make(chan struct{})
 
 	c := &context{
@@ -59,6 +59,11 @@ func (c *context) Resume() error {
 	c.m.Lock()
 	defer c.m.Unlock()
 	return oboe.Resume()
+}
+
+// latencyStats returns the measured latency. The Android/Oboe backend does not record it yet.
+func (c *context) latencyStats() LatencyStats {
+	return LatencyStats{}
 }
 
 func (c *context) Err() error {

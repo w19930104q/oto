@@ -174,7 +174,7 @@ const timeStampValid = kAudioTimeStampSampleTimeValid | kAudioTimeStampHostTimeV
 
 var theContext *context
 
-func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeInBytes int, _ string) (*context, chan struct{}, error) {
+func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeInBytes int, _ string, _ bool) (*context, chan struct{}, error) {
 	// defaultOneBufferSizeInBytes is the default buffer size in bytes.
 	//
 	// 12288 seems necessary at least on iPod touch (7th) and MacBook Pro 2020.
@@ -662,6 +662,11 @@ func (c *context) rebuildAudioQueue() error {
 	c.enqueuedFrames = 0
 	c.timelineOrigin = 0
 	return nil
+}
+
+// latencyStats returns the measured latency. The Darwin backend does not record it yet.
+func (c *context) latencyStats() LatencyStats {
+	return LatencyStats{}
 }
 
 func (c *context) Err() error {

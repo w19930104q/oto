@@ -30,6 +30,7 @@ var (
 	sampleRate   = flag.Int("samplerate", 48000, "sample rate")
 	channelCount = flag.Int("channelcount", 2, "number of channels")
 	format       = flag.String("format", "s16le", "source format (u8, s16le, or f32le)")
+	lowLatency   = flag.Bool("lowlatency", false, "request the low-latency commit mode on supporting drivers (WASAPI)")
 )
 
 type SineWave struct {
@@ -169,6 +170,7 @@ func run() error {
 	default:
 		return fmt.Errorf("format must be u8, s16le, or f32le but: %s", *format)
 	}
+	op.LowLatency = *lowLatency
 	c, ready, err := oto.NewContext(op)
 	if err != nil {
 		return err
@@ -176,6 +178,21 @@ func run() error {
 	<-ready
 	if err := c.Err(); err != nil {
 		return err
+	}
+
+	if *lowLatency {
+		// Print the measured latency once a second so the low-latency mode can
+		// be accepted against its latency statistics.
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				s := c.Latency()
+				fmt.Printf("latency: mode=%v output[p95]=%s commit[max]=%s underruns=%d degradations=%d recoveries=%d target=%s\n",
+					s.LowLatency, s.OutputLatency.P95, s.CommitLatency.Max,
+					s.Underruns, s.Degradations, s.Recoveries, s.TargetLatency)
+			}
+		}()
 	}
 
 	var wg sync.WaitGroup

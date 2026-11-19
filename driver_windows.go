@@ -39,7 +39,7 @@ type context struct {
 	err   atomicError
 }
 
-func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeInBytes int, _ string) (*context, chan struct{}, error) {
+func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeInBytes int, _ string, lowLatency bool) (*context, chan struct{}, error) {
 	ctx := &context{
 		sampleRate:   sampleRate,
 		channelCount: channelCount,
@@ -47,14 +47,14 @@ func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeI
 		ready:        make(chan struct{}),
 	}
 	// TODO: Report when the frames are played with ctx.mux.SetPlayed, from the
-	// delay: on WASAPI, the frames written less the position IAudioClock reports;
-	// on WinMM, the frames written less the position waveOutGetPosition reports.
+	// delay: on WinMM, the frames written less the position waveOutGetPosition
+	// reports. WASAPI reports its played position directly.
 
 	// Initializing drivers might take some time. Do this asynchronously.
 	go func() {
 		defer close(ctx.ready)
 
-		xc, err0 := newWASAPIContext(sampleRate, channelCount, ctx.mux, bufferSizeInBytes)
+		xc, err0 := newWASAPIContext(sampleRate, channelCount, ctx.mux, bufferSizeInBytes, lowLatency)
 		if err0 == nil {
 			ctx.wasapiContext = xc
 			return
@@ -75,6 +75,15 @@ func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeI
 	}()
 
 	return ctx, ctx.ready, nil
+}
+
+// latencyStats returns the latency measured by the active driver.
+func (c *context) latencyStats() LatencyStats {
+	<-c.ready
+	if c.wasapiContext != nil {
+		return c.wasapiContext.latencyStats()
+	}
+	return LatencyStats{}
 }
 
 func (c *context) Suspend() error {

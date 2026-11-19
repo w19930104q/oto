@@ -216,6 +216,39 @@ myPlayer.SetBufferSize(newBufferSize)
 
 `NewPlayer` returns a `*oto.Player`, which has functions like `SetBufferSize` and `Seek`.
 
+### Low latency
+
+For interactive audio, such as UI sound effects, the time between writing a sample and
+hearing it matters. Set `NewContextOptions.LowLatency` to request the low-latency commit
+mode on drivers that support it (currently WASAPI on Windows):
+
+```go
+ctx, ready, err := oto.NewContext(&oto.NewContextOptions{
+    SampleRate:   48000,
+    ChannelCount: 2,
+    Format:       oto.FormatFloat32LE,
+    LowLatency:   true,
+})
+```
+
+In this mode the driver is driven by the audio device's own events and commits only
+enough audio to stay within a small latency budget instead of filling the whole device
+buffer, so the output latency stays bounded. If the process cannot keep the device's
+deadlines, the driver automatically raises the budget (degradation) to keep the audio
+playing without interruption, and lowers it again once the deadlines are met again. The
+audio samples produced are identical to the regular mode; only how much is buffered ahead
+of the device changes. On drivers without a low-latency mode the option is accepted
+without effect, and the regular commit path is unchanged.
+
+`Context.Latency` returns the measured latency, including the commit delay, the audible
+output latency, and the number of underruns and degradations, which can be used to verify
+the behavior at runtime:
+
+```go
+stats := ctx.Latency()
+fmt.Println(stats.OutputLatency.P95, stats.Underruns, stats.Degradations)
+```
+
 ## Crosscompiling
 
 Crosscompiling to macOS, Windows, Linux or BSD is as easy as setting `GOOS=darwin`, `GOOS=windows`,

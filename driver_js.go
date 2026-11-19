@@ -51,7 +51,7 @@ type context struct {
 	mux *mux.Mux
 }
 
-func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeInBytes int, _ string) (*context, chan struct{}, error) {
+func newContext(sampleRate int, channelCount int, format mux.Format, bufferSizeInBytes int, _ string, _ bool) (*context, chan struct{}, error) {
 	ready := make(chan struct{})
 
 	class := js.Global().Get("AudioContext")
@@ -337,6 +337,11 @@ func (c *context) Resume() error {
 	}
 	c.audioContext.Call("resume")
 	return nil
+}
+
+// latencyStats returns the measured latency. The JS backend does not record it yet.
+func (c *context) latencyStats() LatencyStats {
+	return LatencyStats{}
 }
 
 func (c *context) Err() error {
